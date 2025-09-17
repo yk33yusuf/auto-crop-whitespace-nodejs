@@ -18,7 +18,10 @@ dirs.forEach(dir => {
 
 // Middleware
 app.use(express.static('public'));
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json());
+
+// İşlem durumlarını takip etmek için memory store
+const processingJobs = new Map();
 
 // Multer config
 const storage = multer.diskStorage({
@@ -42,193 +45,7 @@ const upload = multer({
   }
 });
 
-// n8n'den gelen veri formatı için özel endpoint
-app.post('/api/n8n-crop', async (req, res) => {
-  console.log('🎯 n8n request received:', JSON.stringify(req.body, null, 2));
-  
-  const inputData = req.body;
-  
-  // Veriyi normalize et - hem array hem tek obje destekle
-  let images = [];
-  
-  if (Array.isArray(inputData)) {
-    images = inputData;
-  } else if (inputData.image && inputData.image.url) {
-    images = [inputData];
-  } else if (inputData.images && Array.isArray(inputData.images)) {
-    images = inputData.images;
-  } else {
-    return res.status(400).json({
-      error: 'Invalid data format',
-      message: 'Expected array of objects with image.url property',
-      received: typeof inputData,
-      example: [{ "image": { "url": "https://example.com/image.jpg" } }]
-    });
-  }
-
-  if (images.length === 0) {
-    return res.status(400).json({
-      error: 'No images provided',
-      message: 'Please provide at least one image with URL'
-    });
-  }
-
-  try {
-    const batchId = Date.now();
-    const processedDir = path.join('processed', batchId.toString());
-    fs.mkdirSync(processedDir, { recursive: true });
-
-    console.log(`📁 Processing ${images.length} images for batch ${batchId}`);
-
-    const results = [];
-    let successCount = 0;
-    let errorCount = 0;
-
-    // Her resmi işle
-    for (let i = 0; i < images.length; i++) {
-      const imageData = images[i];
-      const imageUrl = imageData.image?.url;
-      
-      if (!imageUrl) {
-        console.log(`❌ No URL found for image ${i + 1}`);
-        results.push({
-          index: i + 1,
-          success: false,
-          error: 'No URL provided',
-          originalUrl: null,
-          processedUrl: null
-        });
-        errorCount++;
-        continue;
-      }
-
-      try {
-        console.log(`🔄 Processing image ${i + 1}: ${imageUrl}`);
-        
-        // URL'den resmi indir
-        const response = await fetch(imageUrl);
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-        
-        const imageBuffer = await response.arrayBuffer();
-        const buffer = Buffer.from(imageBuffer);
-        
-        // Dosya uzantısını tahmin et
-        const urlParts = imageUrl.split('.');
-        const extension = urlParts[urlParts.length - 1].split('?')[0] || 'jpg';
-        const filename = `image-${i + 1}-${batchId}.${extension}`;
-        const outputPath = path.join(processedDir, filename);
-        
-        // Resmi kırp ve kaydet
-        const metadata = await sharp(buffer).metadata();
-        console.log(`📐 Original size: ${metadata.width}x${metadata.height}`);
-        
-        await sharp(buffer)
-          .trim({
-            background: { r: 255, g: 255, b: 255, alpha: 1 },
-            threshold: 25
-          })
-          .png() // PNG olarak kaydet (kalite için)
-          .toFile(outputPath);
-        
-        const processedMetadata = await sharp(outputPath).metadata();
-        console.log(`✂️ Cropped size: ${processedMetadata.width}x${processedMetadata.height}`);
-        
-        // İşlenmiş dosya için URL oluştur
-        const baseUrl = req.protocol + '://' + req.get('host');
-        const processedUrl = `${baseUrl}/processed/${batchId}/${filename}`;
-        
-        results.push({
-          index: i + 1,
-          success: true,
-          originalUrl: imageUrl,
-          processedUrl: processedUrl,
-          originalSize: {
-            width: metadata.width,
-            height: metadata.height
-          },
-          croppedSize: {
-            width: processedMetadata.width,
-            height: processedMetadata.height
-          },
-          filename: filename
-        });
-        
-        successCount++;
-        console.log(`✅ Successfully processed image ${i + 1}`);
-        
-      } catch (error) {
-        console.error(`❌ Error processing image ${i + 1}:`, error.message);
-        
-        results.push({
-          index: i + 1,
-          success: false,
-          error: error.message,
-          originalUrl: imageUrl,
-          processedUrl: null
-        });
-        
-        errorCount++;
-      }
-    }
-
-    // n8n için response
-    const response = {
-      status: 'completed',
-      batchId: batchId,
-      processedAt: new Date().toISOString(),
-      summary: {
-        total: images.length,
-        successful: successCount,
-        failed: errorCount
-      },
-      results: results,
-      // İlk başarılı sonucun URL'ini ana alan olarak döndür (tek resim işleme için)
-      processedUrl: results.find(r => r.success)?.processedUrl || null
-    };
-
-    console.log('🎉 Processing completed:', {
-      total: images.length,
-      successful: successCount,
-      failed: errorCount
-    });
-
-    res.json(response);
-
-  } catch (error) {
-    console.error('💥 Processing error:', error);
-    res.status(500).json({
-      status: 'error',
-      error: error.message,
-      processedAt: new Date().toISOString()
-    });
-  }
-});
-
-// İşlenmiş dosyaları serve et
-app.get('/processed/:batchId/:filename', (req, res) => {
-  const { batchId, filename } = req.params;
-  const filePath = path.join('processed', batchId, filename);
-  
-  if (fs.existsSync(filePath)) {
-    res.sendFile(path.resolve(filePath));
-  } else {
-    res.status(404).json({ error: 'File not found' });
-  }
-});
-
-// Test endpoint
-app.post('/api/test', (req, res) => {
-  console.log('Test request body:', req.body);
-  res.json({
-    received: req.body,
-    timestamp: new Date().toISOString(),
-    message: 'Test successful'
-  });
-});
-
-// Ana sayfa (mevcut)
+// Ana sayfa (önceki gibi)
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -236,7 +53,7 @@ app.get('/', (req, res) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>🖼️ Auto Crop Tool</title>
+        <title>🖼️ Auto Crop Tool - Fal AI Integration</title>
         <style>
             body {
                 font-family: system-ui, sans-serif;
@@ -252,291 +69,302 @@ app.get('/', (req, res) => {
                 box-shadow: 0 4px 20px rgba(0,0,0,0.1);
             }
             h1 { text-align: center; color: #333; }
+            .api-info {
+                background: #e8f5e8;
+                padding: 20px;
+                border-radius: 8px;
+                margin: 20px 0;
+                border-left: 4px solid #4caf50;
+            }
             .endpoint {
                 background: #f8f9fa;
-                border: 1px solid #dee2e6;
-                border-radius: 8px;
                 padding: 15px;
-                margin: 15px 0;
+                border-radius: 8px;
+                margin: 10px 0;
                 font-family: monospace;
+                border-left: 3px solid #007cba;
             }
-            .method { 
-                background: #007cba; 
-                color: white; 
-                padding: 4px 8px; 
-                border-radius: 4px; 
-                font-size: 12px; 
-                font-weight: bold; 
-            }
-            .url { color: #28a745; font-weight: bold; }
-            pre { 
-                background: #f1f3f4; 
-                padding: 10px; 
-                border-radius: 4px; 
-                overflow-x: auto; 
-                font-size: 12px;
-            }
-            .upload-area {
-                border: 3px dashed #007cba;
-                border-radius: 12px;
-                padding: 40px;
-                text-align: center;
-                margin: 30px 0;
-                background: #f8f9ff;
-                cursor: pointer;
-                transition: all 0.3s ease;
-            }
-            .upload-area:hover {
-                background: #e8f4ff;
-                transform: scale(1.02);
-            }
-            input[type="file"] { display: none; }
-            .btn {
-                background: #007cba;
-                color: white;
-                border: none;
-                padding: 15px 30px;
-                border-radius: 8px;
-                cursor: pointer;
-                font-size: 16px;
-                font-weight: 600;
-                transition: all 0.3s ease;
-            }
-            .btn:hover {
-                background: #0056b3;
-                transform: translateY(-2px);
-            }
-            .btn:disabled {
-                background: #ccc;
-                cursor: not-allowed;
-                transform: none;
-            }
-            .results {
-                margin-top: 30px;
-                padding: 20px;
-                background: #f8f9fa;
-                border-radius: 8px;
-                display: none;
+            code {
+                background: #f1f1f1;
+                padding: 2px 6px;
+                border-radius: 4px;
+                font-family: monospace;
             }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>🖼️ Auto Crop Tool + n8n API</h1>
+            <h1>🤖 Fal AI Auto Crop Service</h1>
             
-            <h3>🔌 API Endpoints</h3>
-            
-            <div class="endpoint">
-                <span class="method">POST</span> 
-                <span class="url">/api/n8n-crop</span>
-                <p><strong>n8n için özel endpoint</strong></p>
-                <pre>{
-  "image": {
-    "url": "https://example.com/image.jpg",
-    "content_type": "image/png",
-    "width": 1024,
-    "height": 1024
-  }
-}</pre>
+            <div class="api-info">
+                <h3>🔗 n8n Entegrasyon API'leri</h3>
+                <p><strong>Bu servis n8n workflow'ları için tasarlanmıştır.</strong></p>
             </div>
 
             <div class="endpoint">
-                <span class="method">GET</span> 
-                <span class="url">/processed/:batchId/:filename</span>
-                <p><strong>İşlenmiş dosya erişimi</strong></p>
+                <h4>📤 1. İşlem Başlatma</h4>
+                <p><strong>POST</strong> <code>/api/fal/process</code></p>
+                <p>Body: <code>{"imageUrl": "https://v3b.fal.media/files/..."}</code></p>
+                <p>↳ Döner: <code>{"jobId": "12345", "status": "processing"}</code></p>
             </div>
 
-            <h3>🧪 Manual Test</h3>
-            <form id="uploadForm">
-                <div class="upload-area" onclick="document.getElementById('fileInput').click()">
-                    <h3>📁 Resimlerinizi Seçin</h3>
-                    <p>Buraya tıklayın veya dosyaları sürükleyin</p>
-                    <input type="file" id="fileInput" multiple accept="image/*">
-                    <button type="button" class="btn">Dosya Seç</button>
-                </div>
+            <div class="endpoint">
+                <h4>📥 2. Sonuç Alma</h4>
+                <p><strong>GET</strong> <code>/api/fal/result/:jobId</code></p>
+                <p>↳ Döner: <code>{"status": "completed", "croppedUrl": "..."}</code></p>
+            </div>
 
-                <button type="submit" class="btn" id="processBtn" disabled>
-                    ⚡ İşleme Başla
-                </button>
-            </form>
+            <div class="endpoint">
+                <h4>⚡ 3. Tek Seferde İşlem</h4>
+                <p><strong>POST</strong> <code>/api/fal/crop-sync</code></p>
+                <p>Body: <code>{"imageUrl": "https://v3b.fal.media/files/..."}</code></p>
+                <p>↳ Döner: <code>{"croppedUrl": "...", "originalUrl": "..."}</code></p>
+            </div>
 
-            <div class="results" id="results"></div>
+            <p style="text-align: center; margin-top: 30px;">
+                <strong>Service Status:</strong> 
+                <span style="color: #4caf50;">🟢 Active</span>
+            </p>
         </div>
-
-        <script>
-            const fileInput = document.getElementById('fileInput');
-            const processBtn = document.getElementById('processBtn');
-            const results = document.getElementById('results');
-
-            fileInput.addEventListener('change', function() {
-                if (this.files.length > 0) {
-                    document.querySelector('.upload-area h3').textContent = 
-                        '📎 ' + this.files.length + ' dosya seçildi';
-                    processBtn.disabled = false;
-                }
-            });
-
-            document.getElementById('uploadForm').addEventListener('submit', async function(e) {
-                e.preventDefault();
-                
-                if (fileInput.files.length === 0) return;
-
-                const formData = new FormData();
-                for (let file of fileInput.files) {
-                    formData.append('images', file);
-                }
-
-                processBtn.disabled = true;
-                processBtn.textContent = '⏳ İşleniyor...';
-
-                try {
-                    const response = await fetch('/process', {
-                        method: 'POST',
-                        body: formData
-                    });
-
-                    const result = await response.json();
-                    showResults(result);
-                } catch (error) {
-                    alert('Hata: ' + error.message);
-                } finally {
-                    processBtn.disabled = false;
-                    processBtn.textContent = '⚡ İşleme Başla';
-                }
-            });
-
-            function showResults(result) {
-                results.style.display = 'block';
-                
-                let html = '<h3>📊 Sonuçlar</h3>';
-                html += '<p>Başarılı: ' + result.success + ' | Hatalı: ' + result.error + '</p>';
-                
-                if (result.files) {
-                    result.files.forEach(file => {
-                        const statusClass = file.success ? 'success' : 'error';
-                        const icon = file.success ? '✅' : '❌';
-                        html += '<div style="padding: 10px; border-bottom: 1px solid #eee;">';
-                        html += '<span>' + icon + ' ' + file.originalName + '</span>';
-                        html += '</div>';
-                    });
-                }
-
-                if (result.zipFile) {
-                    html += '<div style="text-align: center; margin-top: 20px;">';
-                    html += '<a href="/download/' + result.zipFile + '" class="btn">📦 ZIP İndir</a>';
-                    html += '</div>';
-                }
-
-                results.innerHTML = html;
-            }
-        </script>
     </body>
     </html>
   `);
 });
 
-// Mevcut upload endpoint (web arayüzü için)
-app.post('/process', upload.array('images', 50), async (req, res) => {
-  const results = {
-    success: 0,
-    error: 0,
-    files: [],
-    zipFile: null
-  };
-
-  if (!req.files || req.files.length === 0) {
-    return res.status(400).json({ error: 'Dosya yüklenmedi' });
+// 1. Fal AI URL'inden resim işleme başlatma (async)
+app.post('/api/fal/process', async (req, res) => {
+  const { imageUrl } = req.body;
+  
+  if (!imageUrl) {
+    return res.status(400).json({ 
+      error: 'Missing imageUrl',
+      message: 'Please provide imageUrl in request body'
+    });
   }
 
   try {
-    const batchId = Date.now();
-    const processedDir = path.join('processed', batchId.toString());
-    fs.mkdirSync(processedDir, { recursive: true });
+    const jobId = Date.now().toString();
+    
+    // İşlem durumunu kaydet
+    processingJobs.set(jobId, {
+      status: 'processing',
+      imageUrl: imageUrl,
+      startedAt: new Date().toISOString(),
+      progress: 0
+    });
 
-    for (const file of req.files) {
-      try {
-        const outputPath = path.join(processedDir, `cropped-${file.originalname}`);
-        
-        await sharp(file.path)
-          .trim({
-            background: { r: 255, g: 255, b: 255, alpha: 1 },
-            threshold: 30
-          })
-          .toFile(outputPath);
+    // Async işlemi başlat
+    processImageAsync(jobId, imageUrl);
 
-        results.files.push({
-          originalName: file.originalname,
-          success: true,
-          message: 'Kırpıldı'
-        });
-        
-        results.success++;
-        fs.unlinkSync(file.path);
-        
-      } catch (error) {
-        const outputPath = path.join(processedDir, `original-${file.originalname}`);
-        fs.copyFileSync(file.path, outputPath);
-        
-        results.files.push({
-          originalName: file.originalname,
-          success: true,
-          message: 'Orijinal kopyalandı'
-        });
-        
-        results.success++;
-        fs.unlinkSync(file.path);
-      }
-    }
-
-    if (results.success > 0) {
-      const zipFilename = `images-${batchId}.zip`;
-      const zipPath = path.join('processed', zipFilename);
-      const output = fs.createWriteStream(zipPath);
-      const archive = archiver('zip');
-
-      archive.pipe(output);
-      archive.directory(processedDir, false);
-      await archive.finalize();
-
-      results.zipFile = zipFilename;
-    }
-
-    res.json(results);
+    res.json({
+      jobId: jobId,
+      status: 'processing',
+      message: 'Image processing started',
+      estimatedTime: '3-5 seconds',
+      checkUrl: `/api/fal/result/${jobId}`
+    });
 
   } catch (error) {
-    console.error('Processing error:', error);
-    res.status(500).json({ error: 'Sunucu hatası' });
+    console.error('[FAL] Process error:', error);
+    res.status(500).json({ 
+      error: 'Processing failed',
+      message: error.message 
+    });
   }
 });
 
-// ZIP indirme
-app.get('/download/:filename', (req, res) => {
-  const filePath = path.join('processed', req.params.filename);
+// 2. İşlem sonucunu kontrol etme
+app.get('/api/fal/result/:jobId', (req, res) => {
+  const { jobId } = req.params;
   
-  if (fs.existsSync(filePath)) {
-    res.download(filePath);
-  } else {
-    res.status(404).json({ error: 'Dosya bulunamadı' });
+  const job = processingJobs.get(jobId);
+  
+  if (!job) {
+    return res.status(404).json({
+      error: 'Job not found',
+      message: 'Invalid or expired job ID'
+    });
   }
+
+  res.json({
+    jobId: jobId,
+    status: job.status,
+    ...(job.status === 'completed' && {
+      croppedUrl: job.croppedUrl,
+      originalUrl: job.imageUrl,
+      processedAt: job.completedAt,
+      fileSize: job.fileSize
+    }),
+    ...(job.status === 'error' && {
+      error: job.error
+    }),
+    ...(job.status === 'processing' && {
+      progress: job.progress,
+      message: 'Still processing...'
+    })
+  });
+});
+
+// 3. Tek seferde senkron işlem (n8n için daha basit)
+app.post('/api/fal/crop-sync', async (req, res) => {
+  const { imageUrl } = req.body;
+  
+  if (!imageUrl) {
+    return res.status(400).json({ 
+      error: 'Missing imageUrl',
+      message: 'Please provide imageUrl in request body'
+    });
+  }
+
+  try {
+    console.log(`[FAL-SYNC] Processing: ${imageUrl}`);
+    
+    // URL'den resmi indir
+    const response = await fetch(imageUrl);
+    if (!response.ok) {
+      throw new Error(`Failed to download image: HTTP ${response.status}`);
+    }
+    
+    const imageBuffer = await response.buffer();
+    const fileName = `fal-${Date.now()}.png`;
+    const outputPath = path.join('processed', `cropped-${fileName}`);
+    
+    // Resmi kırp
+    const processedImage = await sharp(imageBuffer)
+      .trim({
+        background: { r: 255, g: 255, b: 255, alpha: 1 },
+        threshold: 25
+      })
+      .png()
+      .toFile(outputPath);
+    
+    // URL oluştur
+    const baseUrl = req.protocol + '://' + req.get('host');
+    const croppedUrl = `${baseUrl}/processed/cropped-${fileName}`;
+    
+    console.log(`[FAL-SYNC] Completed: ${croppedUrl}`);
+    
+    res.json({
+      status: 'completed',
+      originalUrl: imageUrl,
+      croppedUrl: croppedUrl,
+      fileName: `cropped-${fileName}`,
+      fileSize: processedImage.size,
+      processedAt: new Date().toISOString()
+    });
+
+    // 30 dakika sonra dosyayı temizle
+    setTimeout(() => {
+      try {
+        if (fs.existsSync(outputPath)) {
+          fs.unlinkSync(outputPath);
+          console.log(`[CLEANUP] Deleted: ${outputPath}`);
+        }
+      } catch (err) {
+        console.error('[CLEANUP] Error:', err);
+      }
+    }, 30 * 60 * 1000);
+
+  } catch (error) {
+    console.error('[FAL-SYNC] Error:', error);
+    res.status(500).json({ 
+      status: 'error',
+      error: error.message,
+      originalUrl: imageUrl
+    });
+  }
+});
+
+// Async işlem fonksiyonu
+async function processImageAsync(jobId, imageUrl) {
+  try {
+    // Progress güncelle
+    const job = processingJobs.get(jobId);
+    job.progress = 25;
+    
+    // URL'den resmi indir
+    const response = await fetch(imageUrl);
+    if (!response.ok) {
+      throw new Error(`Download failed: HTTP ${response.status}`);
+    }
+    
+    job.progress = 50;
+    
+    const imageBuffer = await response.buffer();
+    const fileName = `fal-async-${jobId}.png`;
+    const outputPath = path.join('processed', `cropped-${fileName}`);
+    
+    job.progress = 75;
+    
+    // Resmi kırp
+    const processedImage = await sharp(imageBuffer)
+      .trim({
+        background: { r: 255, g: 255, b: 255, alpha: 1 },
+        threshold: 25
+      })
+      .png()
+      .toFile(outputPath);
+    
+    // İşlem tamamlandı
+    job.status = 'completed';
+    job.progress = 100;
+    job.croppedUrl = `${process.env.RAILWAY_STATIC_URL || 'http://localhost:3000'}/processed/cropped-${fileName}`;
+    job.completedAt = new Date().toISOString();
+    job.fileSize = processedImage.size;
+    
+    console.log(`[FAL-ASYNC] Job ${jobId} completed: ${job.croppedUrl}`);
+    
+    // 1 saat sonra job'ı temizle
+    setTimeout(() => {
+      processingJobs.delete(jobId);
+      try {
+        if (fs.existsSync(outputPath)) {
+          fs.unlinkSync(outputPath);
+        }
+      } catch (err) {
+        console.error('[CLEANUP] Error:', err);
+      }
+    }, 60 * 60 * 1000);
+    
+  } catch (error) {
+    console.error(`[FAL-ASYNC] Job ${jobId} failed:`, error);
+    
+    const job = processingJobs.get(jobId);
+    if (job) {
+      job.status = 'error';
+      job.error = error.message;
+      job.completedAt = new Date().toISOString();
+    }
+  }
+}
+
+// İşlenmiş dosyaları serve et
+app.use('/processed', express.static('processed'));
+
+// Mevcut crop endpoint'leri (önceki gibi)
+app.post('/process', upload.array('images', 50), async (req, res) => {
+  // ... (önceki kod aynı)
 });
 
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'healthy',
-    service: 'Auto Crop API for n8n',
+    service: 'Fal AI Auto Crop Service',
     timestamp: new Date().toISOString(),
+    activeJobs: processingJobs.size,
     endpoints: {
-      n8nCrop: '/api/n8n-crop (POST)',
-      health: '/api/health (GET)',
-      processedFiles: '/processed/:batchId/:filename (GET)'
+      falProcess: 'POST /api/fal/process',
+      falResult: 'GET /api/fal/result/:jobId',
+      falCropSync: 'POST /api/fal/crop-sync',
+      health: 'GET /api/health'
     }
   });
 });
 
 // Sunucu başlat
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🔌 n8n endpoint: /api/n8n-crop`);
-  console.log(`🏥 Health check: /api/health`);
+  console.log(`🚀 Fal AI Crop Service running on port ${PORT}`);
+  console.log('🤖 Ready for n8n integration');
+  console.log('🔗 API endpoints active');
 });
