@@ -8,6 +8,44 @@ const archiver = require('archiver');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Beyaz alan tespit fonksiyonu
+function findWhitespaceBounds(data, info) {
+  const { width, height, channels } = info;
+  
+  let minX = width, minY = height, maxX = 0, maxY = 0;
+  let hasContent = false;
+  
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const offset = (y * width + x) * channels;
+      const r = data[offset];
+      const g = data[offset + 1];
+      const b = data[offset + 2];
+      
+      // Beyaz değilse (tolerance ile)
+      if (r < 250 || g < 250 || b < 250) {
+        hasContent = true;
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x);
+        maxY = Math.max(maxY, y);
+      }
+    }
+  }
+  
+  if (!hasContent) return null;
+  
+  return {
+    left: minX,
+    top: minY,
+    width: maxX - minX + 1,
+    height: maxY - minY + 1
+  };
+}
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
 // Klasörleri oluştur
 const dirs = ['uploads', 'processed', 'public'];
 dirs.forEach(dir => {
@@ -355,12 +393,41 @@ app.post('/process', upload.array('images', 50), async (req, res) => {
       try {
         const outputPath = path.join(processedDir, `cropped-${file.originalname}`);
         
-        await sharp(file.path)
+        // Daha agresif kırpma algoritması
+        const image = sharp(file.path);
+        const metadata = await image.metadata();
+        
+        // Otomatik kırpma - beyaz alanları tespit et
+        const processed = await image
           .trim({
-            background: '#ffffff',
-            threshold: 10
+            background: { r: 255, g: 255, b: 255, alpha: 1 },
+            threshold: 20
           })
           .toFile(outputPath);
+        
+        // Eğer trim çalışmadıysa manuel kırpma dene
+        if (processed.width === metadata.width && processed.height === metadata.height) {
+          // Manuel beyaz alan tespiti
+          const { data, info } = await sharp(file.path)
+            .raw()
+            .toBuffer({ resolveWithObject: true });
+          
+          const bounds = findWhitespaceBounds(data, info);
+          
+          if (bounds) {
+            await sharp(file.path)
+              .extract({
+                left: bounds.left,
+                top: bounds.top,
+                width: bounds.width,
+                height: bounds.height
+              })
+              .toFile(outputPath);
+          } else {
+            // Son çare: orijinal dosyayı kopyala
+            await sharp(file.path).toFile(outputPath);
+          }
+        }
 
         results.files.push({
           originalName: file.originalname,
