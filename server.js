@@ -233,7 +233,7 @@ app.post('/api/fal/crop-sync', async (req, res) => {
     const processedImage = await sharp(imageBuffer)
       .trim({
         background: { r: 255, g: 255, b: 255, alpha: 1 },
-        threshold: 25
+        threshold: 50
       })
       .png()
       .toFile(outputPath);
