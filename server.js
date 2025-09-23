@@ -225,7 +225,7 @@ app.post('/api/fal/crop-sync', async (req, res) => {
       throw new Error(`Failed to download image: HTTP ${response.status}`);
     }
     
-    const imageBuffer = Buffer.from(await response.arrayBuffer());
+    const imageBuffer = await response.buffer();
     const fileName = `fal-${Date.now()}.png`;
     const outputPath = path.join('processed', `cropped-${fileName}`);
     
